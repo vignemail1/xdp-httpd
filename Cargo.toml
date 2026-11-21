@@ -1,0 +1,25 @@
+[package]
+name = "xdp-httpd"
+version = "0.2.0"
+edition = "2021"
+description = "Serveur HTTP statique minimaliste au-dessus d'AF_XDP"
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:rustls-pemfile"]
+
+[dependencies]
+aya = "0.13"
+xsk-rs = "0.6"
+libc = "0.2"
+smoltcp = { version = "0.11", default-features = false, features = [
+    "std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-cubic" ] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = { version = "2", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
