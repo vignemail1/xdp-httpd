@@ -5,7 +5,8 @@ Serveur HTTP **statique** minimaliste (mémoire et CPU) fonctionnant au-dessus d
 - un programme **eBPF/XDP** filtre les paquets à la source : seuls l'ARP, l'ICMP et le TCP destinés à l'IP du serveur (ports HTTP / HTTPS) sont redirigés vers le socket AF_XDP ; **tout le reste (SSH…) continue vers le noyau** ;
 - une pile TCP/IP en espace utilisateur (**smoltcp**), mono-thread, sans runtime async ni GC ;
 - **HTTPS optionnel** via **rustls** (feature Cargo `tls`) ;
-- **gros fichiers** : streaming par blocs, fichiers > 4 Gio, requêtes `Range` (reprise de téléchargement, lecture vidéo), `HEAD`.
+- **gros fichiers** : streaming par blocs, fichiers > 4 Gio, requêtes `Range` (reprise de téléchargement, lecture vidéo), `HEAD` ;
+- **accès restreint** : seuls les fichiers réguliers du dossier de base sont servis ; tout le reste reçoit une **page de refus personnalisable** (403 par défaut).
 
 > ⚠️ Code fourni **sans avoir été compilé ni testé**. Les API de `xsk-rs`, `aya` et `smoltcp` évoluent : les versions sont figées dans `Cargo.toml` et la section [Erreurs de compilation prévisibles](#erreurs-de-compilation-prévisibles) liste les corrections probables.
 
@@ -27,7 +28,7 @@ xdp-httpd/
 └── src/
     ├── main.rs           # configuration, boucle principale, HTTP/TLS
     ├── dev.rs            # périphérique smoltcp au-dessus d'AF_XDP
-    └── http.rs           # parsing requête, Range, MIME, sécurité des chemins
+    └── http.rs           # parsing requête, Range, MIME, sécurité des chemins, page de refus
 ```
 
 ## Prérequis
@@ -82,11 +83,37 @@ Le serveur possède **sa propre adresse IP**, qui ne doit **pas** être configur
 | `XDP_QUEUE` | non | `0` | file RX de la carte liée au socket |
 | `XDP_PORT` | non | `80` | port HTTP |
 | `XDP_MODE` | non | `auto` | `auto`, `drv` (natif) ou `skb` (générique) |
+| `XDP_ZC` | non | `0` | `1` = tentative de zero-copy (mode natif requis ; repli automatique en mode copie) |
+| `XDP_DENY_FILE` | non | page intégrée | fichier HTML renvoyé pour tout chemin refusé (lu une fois au démarrage) |
+| `XDP_DENY_CODE` | non | `403` | code HTTP de la réponse de refus (400–599) |
 | `XDP_TLS_CERT` | si TLS | — | certificat PEM (chaîne complète) |
 | `XDP_TLS_KEY` | si TLS | — | clé privée PEM (PKCS#8, RSA ou EC) |
 | `XDP_TLS_PORT` | non | `443` | port HTTPS |
 
 Argument positionnel : dossier à servir (défaut : dossier courant).
+
+### Politique d'accès et page de refus
+
+Seuls sont servis les **fichiers réguliers situés dans le dossier de base** (un chemin de dossier sert son `index.html` s'il existe). **Tout le reste** reçoit la même réponse de refus, sans distinction, pour ne rien révéler de l'arborescence :
+
+- fichier ou dossier inexistant ;
+- tentative de sortie de la racine (`..`, `%2e%2e`, chemin absolu, octet nul) ;
+- lien symbolique pointant hors de la racine ;
+- dossier sans `index.html`, fichier spécial (socket, périphérique) ou illisible.
+
+Le corps de la réponse est le fichier HTML de `XDP_DENY_FILE` (page minimale intégrée si absent), le code est `XDP_DENY_CODE` (403 par défaut). Pour `HEAD`, seul l'en-tête est envoyé.
+
+```bash
+echo '<!doctype html><h1>Interdit</h1>' > /etc/xdp-httpd/403.html
+sudo XDP_IF=eth0 XDP_IP=192.168.1.50/24 \
+     XDP_DENY_FILE=/etc/xdp-httpd/403.html XDP_DENY_CODE=404 \
+     ./target/release/xdp-httpd /srv/www
+```
+
+Remarques :
+- le fichier de refus peut se trouver **hors** de la racine servie (il n'est lu qu'au démarrage, jamais depuis une requête) ;
+- les erreurs de protocole gardent leurs codes propres : `400` (requête invalide), `405` (méthode autre que GET/HEAD), `416` (plage invalide sur un fichier existant) ;
+- le démarrage échoue si `XDP_DENY_FILE` est illisible ou si `XDP_DENY_CODE` est hors de 400–599.
 
 ### Une seule file RX
 Le socket AF_XDP n'écoute qu'**une** file. Le plus simple est de réduire la carte à une file (ou de diriger le trafic de l'IP du serveur vers la file choisie avec `ethtool -N`) :
@@ -122,6 +149,8 @@ sudo XDP_IF=v1 XDP_IP=10.0.0.2/24 XDP_MODE=skb ./target/release/xdp-httpd .
 curl -v http://10.0.0.2/
 curl -r 1000-1999 -o part.bin http://10.0.0.2/gros.iso      # Range
 curl -k https://10.0.0.2/                                     # si --features tls
+curl -i http://10.0.0.2/../etc/passwd                         # => page de refus
+curl -i http://10.0.0.2/inexistant                            # => même page de refus
 ```
 
 ### Arrêt / nettoyage
@@ -144,7 +173,7 @@ Constantes en tête de `src/main.rs` :
 
 CPU au repos ≈ 0 : la boucle dort dans `poll()` jusqu'au prochain paquet ou timer TCP.
 
-Limites connues : une connexion = une requête (`Connection: close`), pas de listing de répertoire (sert `index.html`), IPv4 uniquement, pas de TSO / offload de checksum (smoltcp calcule les checksums en logiciel).
+Limites connues : une connexion = une requête (`Connection: close`), pas de listing de répertoire (sert `index.html`), IPv4 uniquement, pas de TSO / offload de checksum (smoltcp calcule les checksums en logiciel). Le corps de la page de refus est envoyé d'un bloc : gardez-le petit (quelques Kio).
 
 ## Erreurs de compilation prévisibles
 
@@ -163,6 +192,8 @@ Limites connues : une connexion = une requête (`Connection: close`), pas de lis
 | `no field max_burst_size` | version smoltcp | supprimer la ligne dans `dev.rs` |
 | erreurs `rustls_pemfile` / `with_single_cert` | versions rustls ↔ pemfile incompatibles | rustls 0.23 + rustls-pemfile 2.x ensemble |
 | `ring` : `failed to run custom build command` | compilateur C absent | `apt install build-essential` |
+| `XDP_ZEROCOPY` / `XDP_COPY` introuvable dans `BindFlags` | nom différent selon la version de `xsk-rs` | consulter `cargo doc --open` et adapter `sock_cfg()` dans `main.rs` |
+| `the ? operator can only be applied ... String` sur `Deny::load(...)?` | `Box<dyn Error>` n'accepte pas `String` via `?` dans votre contexte | remplacer par `.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?` |
 
 ## Erreurs d'exécution prévisibles
 
@@ -176,6 +207,6 @@ Limites connues : une connexion = une requête (`Connection: close`), pas de lis
 | `Cannot allocate memory` à la création UMEM | limite memlock (noyau < 5.11) | `ulimit -l unlimited` |
 | Erreur rustls `aucune clé privée trouvée` | clé chiffrée ou format inconnu | `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key8.pem` |
 | Vérifieur eBPF rejette le programme | noyau trop ancien | noyau ≥ 5.10 |
-
-## Licence
-Programme eBPF : GPL-2.0 (obligatoire pour les helpers utilisés). Reste du code : au choix de l'auteur du dépôt.
+| `erreur: XDP_DENY_FILE <chemin>: No such file or directory` | fichier de refus introuvable ou illisible | vérifier le chemin (absolu recommandé) et les droits de lecture du compte qui lance le serveur |
+| `erreur: XDP_DENY_CODE=200 invalide (attendu 400-599)` | code hors plage d'erreur | utiliser un code entre 400 et 599 |
+| La page de refus s'affiche pour un fichier qui existe | fichier hors racine (lien symbolique sortant), droits insuffisants ou chemin avec `..` | vérifier `readlink -f` du fichier : il doit rester sous le dossier de base |

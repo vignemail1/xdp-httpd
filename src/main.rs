@@ -102,6 +102,10 @@ fn run() -> Res<()> {
     let port: u16 = env("XDP_PORT").map(|q| q.parse()).transpose()?.unwrap_or(80);
     let zc = env("XDP_ZC").as_deref() == Some("1");
 
+    // Page de refus : HTML + code HTTP personnalisables (chargés une seule fois, avant toute modif réseau)
+    let deny_code: Option<u16> = env("XDP_DENY_CODE").map(|c| c.parse()).transpose().map_err(|_| "XDP_DENY_CODE invalide")?;
+    let deny = http::Deny::load(env("XDP_DENY_FILE").as_deref(), deny_code)?;
+
     #[cfg(feature = "tls")]
     let tls_cfg = load_tls()?;
     #[cfg(feature = "tls")]
@@ -203,10 +207,12 @@ fn run() -> Res<()> {
     }
 
     eprintln!(
-        "xdp-httpd: {ip} sur {ifname} file {queue} ({}), HTTP:{port}{}, racine {}",
+        "xdp-httpd: {ip} sur {ifname} file {queue} ({}), HTTP:{port}{}, racine {}, refus {} ({})",
         if zc_on { "zero-copy" } else { "copie" },
         if tls_port != 0 { format!(" HTTPS:{tls_port}") } else { String::new() },
-        root.display()
+        root.display(),
+        deny.code,
+        env("XDP_DENY_FILE").unwrap_or_else(|| "page intégrée".into())
     );
 
     // ---------- Boucle principale ----------
@@ -216,9 +222,9 @@ fn run() -> Res<()> {
         for c in conns.iter_mut() {
             let s = sockets.get_mut::<tcp::Socket>(c.handle);
             #[cfg(feature = "tls")]
-            service(c, s, &root, &mut chunk, tls_cfg.as_ref());
+            service(c, s, &root, &deny, &mut chunk, tls_cfg.as_ref());
             #[cfg(not(feature = "tls"))]
-            service(c, s, &root, &mut chunk);
+            service(c, s, &root, &deny, &mut chunk);
         }
         iface.poll(Instant::now(), &mut dev, &mut sockets);
         dev.reclaim();
@@ -241,6 +247,7 @@ fn service(
     c: &mut Conn,
     s: &mut tcp::Socket,
     root: &Path,
+    deny: &http::Deny,
     chunk: &mut [u8],
     #[cfg(feature = "tls")] tls_cfg: Option<&std::sync::Arc<rustls::ServerConfig>>,
 ) {
@@ -298,7 +305,7 @@ fn service(
     // ----- Requête complète ? -----
     if c.resp.is_none() && !c.closing {
         if let Some(pos) = c.req.windows(4).position(|w| w == b"\r\n\r\n") {
-            let r = http::respond(root, &c.req[..pos + 4]);
+            let r = http::respond(root, deny, &c.req[..pos + 4]);
             push_plain(c, &r.hdr);
             c.resp = Some(r);
         } else if c.req.len() > MAX_REQ {
