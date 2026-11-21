@@ -12,6 +12,8 @@ pub struct Resp {
     pub hdr: Vec<u8>,
     pub file: Option<File>,
     pub remaining: u64,
+    /// Code HTTP de la réponse (journalisation).
+    pub status: u16,
 }
 
 /// Réponse de refus : code HTTP personnalisable + corps HTML (chargé une seule fois au démarrage).
@@ -61,16 +63,18 @@ impl Deny {
         if !head {
             hdr.extend_from_slice(&self.body); // corps ajouté à l'en-tête : un seul envoi, pas de fichier
         }
-        Resp { hdr, file: None, remaining: 0 }
+        Resp { hdr, file: None, remaining: 0, status: self.code }
     }
 }
 
 fn simple(code: &str, extra: &str) -> Resp {
+    let status = code.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(500);
     Resp {
         hdr: format!("HTTP/1.1 {code}\r\nServer: xdp-httpd\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n")
             .into_bytes(),
         file: None,
         remaining: 0,
+        status,
     }
 }
 
@@ -199,13 +203,14 @@ pub fn respond(root: &Path, deny: &Deny, req: &[u8]) -> Resp {
     if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
         return simple("500 Internal Server Error", "");
     }
+    let code: u16 = status.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(200);
     let hdr = format!(
         "HTTP/1.1 {status}\r\nServer: xdp-httpd\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n"
     )
     .into_bytes();
     if head {
-        Resp { hdr, file: None, remaining: 0 }
+        Resp { hdr, file: None, remaining: 0, status: code }
     } else {
-        Resp { hdr, file: Some(file), remaining: len }
+        Resp { hdr, file: Some(file), remaining: len, status: code }
     }
 }

@@ -1,5 +1,6 @@
 mod dev;
 mod http;
+mod log;
 
 use aya::maps::XskMap;
 use aya::programs::{Xdp, XdpFlags};
@@ -45,6 +46,19 @@ struct Conn {
     resp: Option<http::Resp>,
     out: Vec<u8>, // octets prêts à partir sur TCP (chiffrés si TLS)
     closing: bool,
+    // journalisation : une ligne d'accès par requête traitée
+    pending: Option<PendingLog>,
+    total: u64, // octets de corps envoyés pour la requête en cours
+}
+
+/// Informations de la requête en cours, conservées jusqu'à la fin de la réponse.
+struct PendingLog {
+    method: String,
+    target: String,
+    status: u16,
+    referer: Option<String>,
+    ua: Option<String>,
+    head: bool,
 }
 
 impl Conn {
@@ -57,6 +71,8 @@ impl Conn {
         self.resp = None;
         self.out.clear();
         self.closing = false;
+        self.pending = None;
+        self.total = 0;
     }
 }
 
@@ -92,7 +108,19 @@ fn sock_cfg(zc: bool) -> SocketConfig {
 
 fn run() -> Res<()> {
     // ---------- Configuration ----------
-    let root: PathBuf = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| ".".into()).canonicalize()?;
+    // `--jsonc` (ou XDP_JSONC=1) : journaux au format JSON, une ligne par évènement.
+    let mut jsonc = env("XDP_JSONC").as_deref() == Some("1");
+    let mut positional: Vec<String> = Vec::new();
+    for a in std::env::args().skip(1) {
+        if a == "--jsonc" {
+            jsonc = true;
+        } else {
+            positional.push(a);
+        }
+    }
+    let logger = log::Logger { json: jsonc };
+
+    let root: PathBuf = positional.first().map(PathBuf::from).unwrap_or_else(|| ".".into()).canonicalize()?;
     let ifname = env("XDP_IF").ok_or("XDP_IF manquant (ex. XDP_IF=eth0)")?;
     let cidr: IpCidr = env("XDP_IP").ok_or("XDP_IP manquant (ex. 192.168.1.50/24)")?.parse().map_err(|_| "XDP_IP invalide")?;
     let IpCidr::Ipv4(c4) = cidr;
@@ -113,7 +141,7 @@ fn run() -> Res<()> {
     #[cfg(not(feature = "tls"))]
     let tls_port: u16 = {
         if env("XDP_TLS_CERT").is_some() {
-            eprintln!("avertissement: XDP_TLS_CERT ignoré (compilé sans --features tls)");
+            logger.error("warn", "XDP_TLS_CERT ignoré (compilé sans --features tls)");
         }
         0
     };
@@ -150,7 +178,7 @@ fn run() -> Res<()> {
     let (tx, rx, fqcq, zc_on) = match unsafe { Socket::new(sock_cfg(zc), &umem, &xif, queue) } {
         Ok((t, r, f)) => (t, r, f, zc),
         Err(e) if zc => {
-            eprintln!("xdp-httpd: zero-copy refusé ({e}), repli en mode copie");
+            logger.error("warn", &format!("zero-copy refusé ({e}), repli en mode copie"));
             let (t, r, f) = unsafe { Socket::new(sock_cfg(false), &umem, &xif, queue) }?;
             (t, r, f, false)
         }
@@ -202,17 +230,22 @@ fn run() -> Res<()> {
                 resp: None,
                 out: Vec::new(),
                 closing: false,
+                pending: None,
+                total: 0,
             });
         }
     }
 
-    eprintln!(
-        "xdp-httpd: {ip} sur {ifname} file {queue} ({}), HTTP:{port}{}, racine {}, refus {} ({})",
-        if zc_on { "zero-copy" } else { "copie" },
-        if tls_port != 0 { format!(" HTTPS:{tls_port}") } else { String::new() },
-        root.display(),
-        deny.code,
-        env("XDP_DENY_FILE").unwrap_or_else(|| "page intégrée".into())
+    logger.error(
+        "notice",
+        &format!(
+            "xdp-httpd: {ip} sur {ifname} file {queue} ({}), HTTP:{port}{}, racine {}, refus {} ({})",
+            if zc_on { "zero-copy" } else { "copie" },
+            if tls_port != 0 { format!(" HTTPS:{tls_port}") } else { String::new() },
+            root.display(),
+            deny.code,
+            env("XDP_DENY_FILE").unwrap_or_else(|| "page intégrée".into())
+        ),
     );
 
     // ---------- Boucle principale ----------
@@ -222,9 +255,9 @@ fn run() -> Res<()> {
         for c in conns.iter_mut() {
             let s = sockets.get_mut::<tcp::Socket>(c.handle);
             #[cfg(feature = "tls")]
-            service(c, s, &root, &deny, &mut chunk, tls_cfg.as_ref());
+            service(c, s, &root, &deny, &mut chunk, &logger, tls_cfg.as_ref());
             #[cfg(not(feature = "tls"))]
-            service(c, s, &root, &deny, &mut chunk);
+            service(c, s, &root, &deny, &mut chunk, &logger);
         }
         iface.poll(Instant::now(), &mut dev, &mut sockets);
         dev.reclaim();
@@ -243,15 +276,31 @@ fn run() -> Res<()> {
     }
 }
 
+/// Écrit la ligne d'accès de la requête en cours (une seule fois), puis l'efface.
+fn flush_access(c: &mut Conn, s: &tcp::Socket, logger: &log::Logger) {
+    if let Some(p) = c.pending.take() {
+        let ip = s.remote_endpoint().and_then(|e| match e.addr {
+            smoltcp::wire::IpAddress::Ipv4(a) => Some(Ipv4Addr::from(a.0)),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        });
+        let bytes = if p.head { 0 } else { c.total };
+        logger.access(ip, &p.method, &p.target, p.status, bytes, p.referer.as_deref(), p.ua.as_deref());
+    }
+}
+
 fn service(
     c: &mut Conn,
     s: &mut tcp::Socket,
     root: &Path,
     deny: &http::Deny,
     chunk: &mut [u8],
+    logger: &log::Logger,
     #[cfg(feature = "tls")] tls_cfg: Option<&std::sync::Arc<rustls::ServerConfig>>,
 ) {
     if !s.is_open() {
+        // connexion interrompue avant la fin de la réponse : on journalise ce qui a été servi
+        flush_access(c, s, logger);
         c.reset();
         let _ = s.listen(c.port);
         return;
@@ -286,6 +335,7 @@ fn service(
         while !rd.is_empty() {
             if sess.read_tls(&mut rd).is_err() { s.abort(); return; }
             if sess.process_new_packets().is_err() {
+                logger.error("error", "échec TLS (handshake ou enregistrement invalide)");
                 let _ = sess.write_tls(&mut c.out);
                 let _ = s.send_slice(&c.out);
                 s.close();
@@ -305,10 +355,26 @@ fn service(
     // ----- Requête complète ? -----
     if c.resp.is_none() && !c.closing {
         if let Some(pos) = c.req.windows(4).position(|w| w == b"\r\n\r\n") {
-            let r = http::respond(root, deny, &c.req[..pos + 4]);
+            let reqb = &c.req[..pos + 4];
+            let (method, target) = log::request_line(reqb);
+            let pending = PendingLog {
+                head: method == "HEAD",
+                referer: log::header(reqb, "referer"),
+                ua: log::header(reqb, "user-agent"),
+                method,
+                target,
+                status: 0,
+            };
+            let r = http::respond(root, deny, reqb);
+            if r.status >= 500 {
+                logger.error("error", &format!("réponse {} pour {} {}", r.status, pending.method, pending.target));
+            }
+            c.pending = Some(PendingLog { status: r.status, ..pending });
+            c.total = (r.hdr.len() as u64).saturating_sub(header_len(&r.hdr));
             push_plain(c, &r.hdr);
             c.resp = Some(r);
         } else if c.req.len() > MAX_REQ {
+            logger.error("warn", "requête trop grande, connexion abandonnée");
             s.abort();
             return;
         }
@@ -326,9 +392,15 @@ fn service(
         let Some(f) = r.file.as_mut() else { break };
         let want = (chunk.len() as u64).min(r.remaining) as usize;
         match f.read(&mut chunk[..want]) {
-            Ok(0) | Err(_) => { r.remaining = 0; c.closing = true; break; }
+            Ok(0) | Err(_) => {
+                logger.error("error", "lecture du fichier interrompue avant la fin");
+                r.remaining = 0;
+                c.closing = true;
+                break;
+            }
             Ok(n) => {
                 r.remaining -= n as u64;
+                c.total += n as u64;
                 let data = chunk[..n].to_vec();
                 push_plain(c, &data);
             }
@@ -348,10 +420,16 @@ fn service(
         if let Some(sess) = c.sess.as_mut() {
             if !c.closing { sess.send_close_notify(); c.closing = true; let _ = sess.write_tls(&mut c.out); return; }
         }
+        flush_access(c, s, logger);
         s.close();
         c.resp = None;
         c.closing = true;
     }
+}
+
+/// Longueur de l'en-tête HTTP seul (jusqu'au premier \r\n\r\n inclus).
+fn header_len(buf: &[u8]) -> u64 {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p as u64 + 4).unwrap_or(buf.len() as u64)
 }
 
 /// Ajoute des octets applicatifs à la file de sortie (chiffrés si TLS).
