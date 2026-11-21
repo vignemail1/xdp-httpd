@@ -1,4 +1,9 @@
 //! Parsing minimal HTTP/1.x, résolution sûre des chemins, Range, MIME.
+//!
+//! Politique d'accès : seuls les fichiers réguliers situés DANS la racine sont servis.
+//! Tout le reste (inexistant, `..`, lien symbolique sortant, dossier sans index.html,
+//! fichier illisible) reçoit la même réponse de refus (403 par défaut, personnalisable),
+//! afin de ne rien révéler de l'arborescence.
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +12,57 @@ pub struct Resp {
     pub hdr: Vec<u8>,
     pub file: Option<File>,
     pub remaining: u64,
+}
+
+/// Réponse de refus : code HTTP personnalisable + corps HTML (chargé une seule fois au démarrage).
+pub struct Deny {
+    pub code: u16,
+    pub body: Vec<u8>,
+}
+
+const DEFAULT_BODY: &str = "<!doctype html><html><head><meta charset=utf-8><title>Acc\u{e8}s refus\u{e9}</title></head>\
+<body><h1>Acc\u{e8}s refus\u{e9}</h1></body></html>";
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        410 => "Gone",
+        451 => "Unavailable For Legal Reasons",
+        _ => "Denied",
+    }
+}
+
+impl Deny {
+    /// `file` : chemin du HTML de refus (optionnel) ; `code` : code HTTP (défaut 403).
+    pub fn load(file: Option<&str>, code: Option<u16>) -> Result<Deny, String> {
+        let code = code.unwrap_or(403);
+        if !(400..=599).contains(&code) {
+            return Err(format!("XDP_DENY_CODE={code} invalide (attendu 400-599)"));
+        }
+        let body = match file {
+            Some(p) => std::fs::read(p).map_err(|e| format!("XDP_403_FILE {p}: {e}"))?,
+            None => DEFAULT_BODY.as_bytes().to_vec(),
+        };
+        Ok(Deny { code, body })
+    }
+
+    /// Construit la réponse de refus (le corps est omis pour HEAD).
+    fn response(&self, head: bool) -> Resp {
+        let hdr = format!(
+            "HTTP/1.1 {} {}\r\nServer: xdp-httpd\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.code,
+            reason(self.code),
+            self.body.len()
+        );
+        let mut hdr = hdr.into_bytes();
+        if !head {
+            hdr.extend_from_slice(&self.body); // corps ajouté à l'en-tête : un seul envoi, pas de fichier
+        }
+        Resp { hdr, file: None, remaining: 0 }
+    }
 }
 
 fn simple(code: &str, extra: &str) -> Resp {
@@ -66,7 +122,8 @@ fn pct_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Refuse toute tentative de sortie de la racine (`..`, chemins absolus).
+/// Résout la cible vers un fichier RÉGULIER situé dans la racine, sinon `None`.
+/// Refuse `..`, chemins absolus, octets nuls et liens symboliques sortant de la racine.
 fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     let path = target.split(['?', '#']).next()?;
     let path = pct_decode(path)?;
@@ -78,15 +135,15 @@ fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
         match c {
             Component::Normal(s) => p.push(s),
             Component::RootDir | Component::CurDir => {}
-            _ => return None,
+            _ => return None, // ParentDir, Prefix
         }
     }
     if p.is_dir() {
         p.push("index.html");
     }
-    // anti-symlink sortant de la racine
+    // anti-symlink sortant de la racine (root est déjà canonique)
     let canon = p.canonicalize().ok()?;
-    canon.starts_with(root).then_some(canon)
+    (canon.starts_with(root) && canon.is_file()).then_some(canon)
 }
 
 /// `bytes=a-b`, `bytes=a-`, `bytes=-n` (une seule plage).
@@ -109,7 +166,7 @@ fn parse_range(v: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
 }
 
 /// Construit la réponse à partir d'une requête complète (jusqu'à \r\n\r\n).
-pub fn respond(root: &Path, req: &[u8]) -> Resp {
+pub fn respond(root: &Path, deny: &Deny, req: &[u8]) -> Resp {
     let Ok(text) = std::str::from_utf8(req) else { return simple("400 Bad Request", "") };
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or("").split(' ');
@@ -124,11 +181,12 @@ pub fn respond(root: &Path, req: &[u8]) -> Resp {
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("range"))
         .map(|(_, v)| v.to_string());
 
-    let Some(path) = resolve(root, target) else { return simple("404 Not Found", "") };
-    let Ok(mut file) = File::open(&path) else { return simple("404 Not Found", "") };
-    let Ok(meta) = file.metadata() else { return simple("500 Internal Server Error", "") };
+    // Tout ce qui n'est pas un fichier régulier lisible de la racine => même refus.
+    let Some(path) = resolve(root, target) else { return deny.response(head) };
+    let Ok(mut file) = File::open(&path) else { return deny.response(head) };
+    let Ok(meta) = file.metadata() else { return deny.response(head) };
     if !meta.is_file() {
-        return simple("404 Not Found", "");
+        return deny.response(head);
     }
     let size = meta.len();
     let ct = mime(&path);
