@@ -81,6 +81,15 @@ fn main() {
     }
 }
 
+fn sock_cfg(zc: bool) -> SocketConfig {
+    let mut bf = BindFlags::XDP_USE_NEED_WAKEUP;
+    bf |= if zc { BindFlags::XDP_ZEROCOPY } else { BindFlags::XDP_COPY };
+    SocketConfig::builder()
+        .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD) // notre propre programme
+        .bind_flags(bf)
+        .build()
+}
+
 fn run() -> Res<()> {
     // ---------- Configuration ----------
     let root: PathBuf = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| ".".into()).canonicalize()?;
@@ -91,6 +100,7 @@ fn run() -> Res<()> {
     let gw: Option<Ipv4Addr> = env("XDP_GW").map(|g| g.parse()).transpose()?;
     let queue: u32 = env("XDP_QUEUE").map(|q| q.parse()).transpose()?.unwrap_or(0);
     let port: u16 = env("XDP_PORT").map(|q| q.parse()).transpose()?.unwrap_or(80);
+    let zc = env("XDP_ZC").as_deref() == Some("1");
 
     #[cfg(feature = "tls")]
     let tls_cfg = load_tls()?;
@@ -121,21 +131,27 @@ fn run() -> Res<()> {
         .load(BPF_OBJ)?;
     let prog: &mut Xdp = bpf.program_mut("xdp_httpd").ok_or("programme xdp_httpd absent")?.try_into()?;
     prog.load()?;
+    // Le zero-copy exige le mode natif (pilote).
     let flags = match env("XDP_MODE").as_deref() {
         Some("skb") => XdpFlags::SKB_MODE,
         Some("drv") => XdpFlags::DRV_MODE,
+        _ if zc => XdpFlags::DRV_MODE,
         _ => XdpFlags::default(),
     };
-    prog.attach(&ifname, flags).map_err(|e| format!("attache XDP sur {ifname}: {e} (essayez XDP_MODE=skb)"))?;
+    prog.attach(&ifname, flags).map_err(|e| format!("attache XDP sur {ifname}: {e} (essayez XDP_MODE=skb sans XDP_ZC)"))?;
 
     // ---------- Socket AF_XDP ----------
     let (umem, mut descs) = Umem::new(UmemConfig::default(), NonZeroU32::new(FRAMES).unwrap(), false)?;
-    let sock_cfg = SocketConfig::builder()
-        .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD) // notre propre programme
-        .bind_flags(BindFlags::XDP_USE_NEED_WAKEUP)
-        .build();
     let xif: XskIf = ifname.parse()?;
-    let (tx, rx, fqcq) = unsafe { Socket::new(sock_cfg, &umem, &xif, queue) }?;
+    let (tx, rx, fqcq, zc_on) = match unsafe { Socket::new(sock_cfg(zc), &umem, &xif, queue) } {
+        Ok((t, r, f)) => (t, r, f, zc),
+        Err(e) if zc => {
+            eprintln!("xdp-httpd: zero-copy refusé ({e}), repli en mode copie");
+            let (t, r, f) = unsafe { Socket::new(sock_cfg(false), &umem, &xif, queue) }?;
+            (t, r, f, false)
+        }
+        Err(e) => return Err(e.into()),
+    };
     let (mut fq, cq) = fqcq.ok_or("file fill/completion absente")?;
 
     let mut xsks = XskMap::try_from(bpf.map_mut("xsks").ok_or("map xsks absente")?)?;
@@ -187,7 +203,8 @@ fn run() -> Res<()> {
     }
 
     eprintln!(
-        "xdp-httpd: {ip} sur {ifname} file {queue}, HTTP:{port}{}, racine {}",
+        "xdp-httpd: {ip} sur {ifname} file {queue} ({}), HTTP:{port}{}, racine {}",
+        if zc_on { "zero-copy" } else { "copie" },
         if tls_port != 0 { format!(" HTTPS:{tls_port}") } else { String::new() },
         root.display()
     );

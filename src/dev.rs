@@ -1,5 +1,5 @@
 //! Périphérique smoltcp au-dessus d'un socket AF_XDP (xsk-rs 0.6).
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use std::io::Write;
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, TxQueue, Umem};
@@ -102,6 +102,12 @@ impl Device for XdpDev {
         c.medium = Medium::Ethernet;
         c.max_transmission_unit = 1514;
         c.max_burst_size = Some(64);
+        // XDP_RX_CSUM=off : ne vérifie plus les checksums en réception (réseau fiable uniquement)
+        if std::env::var("XDP_RX_CSUM").as_deref() == Ok("off") {
+            c.checksum.ipv4 = Checksum::Tx;
+            c.checksum.tcp = Checksum::Tx;
+            c.checksum.icmpv4 = Checksum::Tx;
+        }
         c
     }
 }
