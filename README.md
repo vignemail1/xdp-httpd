@@ -7,7 +7,8 @@ Serveur HTTP **statique** minimaliste (mémoire et CPU) fonctionnant au-dessus d
 - **HTTPS optionnel** via **rustls** (feature Cargo `tls`) ;
 - **gros fichiers** : streaming par blocs, fichiers > 4 Gio, requêtes `Range` (reprise de téléchargement, lecture vidéo), `HEAD` ;
 - **accès restreint** : seuls les fichiers réguliers du dossier de base sont servis ; tout le reste reçoit une **page de refus personnalisable** (403 par défaut) ;
-- **zero-copy** optionnel (`XDP_ZC=1`) avec repli automatique en mode copie.
+- **zero-copy** optionnel (`XDP_ZC=1`) avec repli automatique en mode copie ;
+- **journalisation** : accès au format Common Log sur stdout, erreurs sur stderr, sortie JSON optionnelle (`--jsonc`).
 
 > ⚠️ Code fourni **sans avoir été compilé ni testé**. Les API de `xsk-rs`, `aya` et `smoltcp` évoluent : les versions sont figées dans `Cargo.toml` et la section [Erreurs de compilation prévisibles](#erreurs-de-compilation-prévisibles) liste les corrections probables.
 
@@ -29,7 +30,8 @@ xdp-httpd/
 └── src/
     ├── main.rs           # configuration, boucle principale, HTTP/TLS
     ├── dev.rs            # périphérique smoltcp au-dessus d'AF_XDP
-    └── http.rs           # parsing requête, Range, MIME, sécurité des chemins, page de refus
+    ├── http.rs           # parsing requête, Range, MIME, sécurité des chemins, page de refus
+    └── log.rs            # journaux d'accès (Common Log / JSON) et d'erreurs
 ```
 
 ## Prérequis
@@ -88,11 +90,43 @@ Le serveur possède **sa propre adresse IP**, qui ne doit **pas** être configur
 | `XDP_RX_CSUM` | non | vérifié | `off` = ne pas vérifier les checksums à la réception (checksums toujours calculés à l'émission) ; à réserver à un réseau fiable |
 | `XDP_DENY_FILE` | non | page intégrée | fichier HTML renvoyé pour tout chemin refusé (lu une fois au démarrage) |
 | `XDP_DENY_CODE` | non | `403` | code HTTP de la réponse de refus (400–599) |
+| `XDP_JSONC` | non | `0` | `1` = journaux au format JSON (équivalent de `--jsonc`) |
 | `XDP_TLS_CERT` | si TLS | — | certificat PEM (chaîne complète) |
 | `XDP_TLS_KEY` | si TLS | — | clé privée PEM (PKCS#8, RSA ou EC) |
 | `XDP_TLS_PORT` | non | `443` | port HTTPS |
 
-Argument positionnel : dossier à servir (défaut : dossier courant).
+Argument positionnel : dossier à servir (défaut : dossier courant). Option : `--jsonc` (voir [Journalisation](#journalisation)).
+
+### Journalisation
+
+Une ligne d'accès est écrite **par requête traitée**, quand la réponse est terminée (ou interrompue). Les erreurs et messages de service vont sur **stderr**, les accès sur **stdout** : les deux flux se redirigent indépendamment.
+
+**Accès (stdout), format Common Log étendu** (referer et user-agent) :
+```
+192.168.1.20 - - [21/Nov/2026:16:13:27 +0000] "GET /index.html HTTP/1.1" 200 5123 "-" "curl/8.5.0"
+```
+- l'heure est en **UTC** ;
+- le nombre d'octets est celui du **corps** de la réponse (0 pour `HEAD`) ; pour un téléchargement interrompu, c'est la quantité effectivement envoyée ;
+- les guillemets, antislash et caractères de contrôle sont échappés (`\"`, `\\`, `\x0a`) ;
+- la cible est journalisée **telle que reçue** (avant décodage), y compris pour les chemins refusés.
+
+**Erreurs (stderr), style Apache** :
+```
+[21/Nov/2026:16:13:27 +0000] [notice] xdp-httpd: 192.168.1.50 sur eth0 file 0 (copie), HTTP:80, racine /srv/www, refus 403 (page intégrée)
+[21/Nov/2026:16:14:02 +0000] [warn] zero-copy refusé (...), repli en mode copie
+```
+Niveaux utilisés : `notice` (démarrage), `warn` (repli, requête trop grande), `error` (échec TLS, lecture de fichier interrompue, réponse 5xx).
+
+**Sortie JSON** avec `--jsonc` ou `XDP_JSONC=1`, une ligne par évènement, `datetime` en UTC à la milliseconde :
+```json
+{"datetime":"2026-11-21T16:13:27.412Z","remote":"192.168.1.20","method":"GET","target":"/index.html","status":200,"bytes":5123,"referer":"","user_agent":"curl/8.5.0"}
+{"datetime":"2026-11-21T16:14:02.003Z","level":"warn","message":"zero-copy refusé (...), repli en mode copie"}
+```
+```bash
+sudo XDP_IF=eth0 XDP_IP=192.168.1.50/24 ./target/release/xdp-httpd --jsonc /srv/www \
+     > access.jsonl 2> error.log
+```
+Limites : IPv4 uniquement ; les erreurs fatales de démarrage (avant l'initialisation) restent écrites en texte simple sur stderr ; pas de rotation intégrée (utilisez `logrotate` ou `systemd-journald`).
 
 ### Politique d'accès et page de refus
 
@@ -222,6 +256,7 @@ Limites connues : une connexion = une requête (`Connection: close`), pas de lis
 | `ring` : `failed to run custom build command` | compilateur C absent | `apt install build-essential` |
 | `XDP_ZEROCOPY` / `XDP_COPY` introuvable dans `BindFlags` | nom différent selon la version de `xsk-rs` | consulter `cargo doc --open` et adapter `sock_cfg()` dans `main.rs` |
 | `the ? operator can only be applied ... String` sur `Deny::load(...)?` | `Box<dyn Error>` n'accepte pas `String` via `?` dans votre contexte | remplacer par `.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?` |
+| `no field addr` / `remote_endpoint` : type inattendu dans `flush_access` (`main.rs`) | smoltcp renvoie `Option<IpEndpoint>` (0.11) ; autre forme selon la version | adapter l'extraction de l'adresse distante selon `cargo doc --open` |
 
 ## Erreurs d'exécution prévisibles
 
@@ -240,3 +275,4 @@ Limites connues : une connexion = une requête (`Connection: close`), pas de lis
 | `erreur: XDP_DENY_FILE <chemin>: No such file or directory` | fichier de refus introuvable ou illisible | vérifier le chemin (absolu recommandé) et les droits de lecture du compte qui lance le serveur |
 | `erreur: XDP_DENY_CODE=200 invalide (attendu 400-599)` | code hors plage d'erreur | utiliser un code entre 400 et 599 |
 | La page de refus s'affiche pour un fichier qui existe | fichier hors racine (lien symbolique sortant), droits insuffisants ou chemin avec `..` | vérifier `readlink -f` du fichier : il doit rester sous le dossier de base |
+| Adresse distante `-` dans les journaux d'accès | connexion déjà fermée côté pile au moment de l'écriture de la ligne | comportement attendu pour certaines requêtes interrompues |
